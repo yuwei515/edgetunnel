@@ -4,6 +4,75 @@ let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓�
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
+// Cloudflare 公开 IP 段 -> 地区 中文映射表（轻量方案，无外部 API）
+// 数据来源：Cloudflare 官方公布的 IPv4/IPv6 CIDR。按「最长前缀匹配」查找。
+// 命中即返回中文地区名；未命中返回空字符串（代表作非 CF 段或无法识别，调用方按需处理）。
+// 注：CF 同一段常跨多个 PoP，本表只取代表性大段，粒度到「地区」级，不做城市细分。
+const Cloudflare地区映射表 = [
+	// 香港
+	['104.16.0.0/13', '香港'], ['172.64.0.0/13', '香港'], ['162.158.0.0/15', '香港'],
+	// 日本（东京/大阪）
+	['104.20.0.0/14', '日本'], ['172.68.0.0/13', '日本'], ['141.101.64.0/18', '日本'],
+	// 美国
+	['1.1.1.0/24', '美国'], ['104.24.0.0/14', '美国'], ['172.70.0.0/15', '美国'],
+	['173.245.48.0/20', '美国'], ['188.114.96.0/20', '美国'], ['190.93.240.0/20', '美国'],
+	['197.234.240.0/22', '美国'], ['198.41.192.0/21', '美国'],
+	// 新加坡
+	['104.28.0.0/14', '新加坡'], ['162.158.128.0/20', '新加坡'],
+	// 韩国
+	['175.45.0.0/22', '韩国'],
+	// 台湾
+	['103.21.244.0/22', '台湾'], ['103.22.200.0/22', '台湾'], ['103.31.4.0/22', '台湾'],
+	// 欧洲代表性大段（德国/英国/法国统称「欧洲」以控制粒度）
+	['188.114.128.0/18', '欧洲'], ['141.101.0.0/18', '欧洲'], ['131.0.72.0/22', '欧洲'],
+];
+// 将点分 IPv4 字符串转为 32 位无符号整数；非法返回 null
+function IPv4转整数(ip) {
+	const 段 = ip.split('.');
+	if (段.length !== 4) return null;
+	let n = 0;
+	for (const s of 段) {
+		const v = Number(s);
+		if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+		n = (n * 256 + v) >>> 0;
+	}
+	return n;
+}
+// CIDR 最长前缀匹配，按 IPv4 处理；[IPv6] 与非 IP 地址一律返回空串
+function 识别地区(地址) {
+	if (!地址) return '';
+	let ip = 地址;
+	// 去掉 IPv6 方括号并把 host:port 中的端口剥掉
+	if (ip.startsWith('[') && ip.endsWith(']')) return ''; // IPv6 暂不识别地区
+	if (ip.includes(':')) ip = ip.split(':').slice(0, -1).join(':') || ip; // 末段是端口才剥
+	// 必须是纯 IPv4，域名/主机名不查表
+	if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) return '';
+	const ipInt = IPv4转整数(ip);
+	if (ipInt === null) return '';
+	let 命中地区 = '', 命中前缀 = -1;
+	for (const [cidr, 地区] of Cloudflare地区映射表) {
+		const [base, prefixStr] = cidr.split('/');
+		const prefix = parseInt(prefixStr, 10);
+		if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) continue;
+		const baseInt = IPv4转整数(base);
+		if (baseInt === null) continue;
+		// 只匹配前缀更长（更精确）的命中，实现最长前缀匹配
+		if (prefix <= 命中前缀) continue;
+		const mask = prefix === 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) >>> 0;
+		if (((ipInt ^ baseInt) & mask) === 0) {
+			命中地区 = 地区;
+			命中前缀 = prefix;
+		}
+	}
+	return 命中地区;
+}
+// 解析 ?region= 参数为去重小写数组；空或不存在返回 null（= 不过滤）
+function 解析地区过滤参数(url) {
+	const raw = url.searchParams.get('region');
+	if (!raw) return null;
+	const 列表 = raw.split(/[，,\s]+/).map(s => s.trim()).filter(Boolean);
+	return 列表.length ? 列表 : null;
+}
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
@@ -398,6 +467,16 @@ export default {
 							const ECHLINK参数 = config_JSON.ECH ? `&ech=${encodeURIComponent((config_JSON.ECHConfig.SNI ? config_JSON.ECHConfig.SNI + '+' : '') + config_JSON.ECHConfig.DNS)}` : '';
 							const isLoonOrSurge = ua.includes('loon') || ua.includes('surge');
 							const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
+							// P1: 按地区筛选订阅 —— ?region=香港 或 ?region=美国,日本
+							// 仅作用于 CF 优选 IP 节点；用户手填的第三方节点(其他节点LINK)全部保留不参与过滤。
+							const 地区过滤 = 解析地区过滤参数(url);
+							if (地区过滤) 完整优选IP = 完整优选IP.filter(原始地址 => {
+								const m = 原始地址.match(/^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9.-]+)(?::\d+)?(?:#.+)?$/);
+								if (!m) return false;
+								return 地区过滤.includes(识别地区(m[1]));
+							});
+							// P0: 每个地区独立的序号计数器（闭包），用于无备注节点生成"地区-序号"
+							const 地区序号计数 = new Map();
 							订阅内容 = 其他节点LINK + 完整优选IP.map(原始地址 => {
 								// 统一正则: 匹配 域名/IPv4/IPv6地址 + 可选端口 + 可选备注
 								// 示例:
@@ -412,7 +491,20 @@ export default {
 								if (match) {
 									节点地址 = match[1];  // IP地址或域名(可能带方括号)
 									节点端口 = match[2] ? match[2] : '443';  // 端口默认443，SS noTLS在生成链接时再映射
-									节点备注 = match[3] || 节点地址;  // 备注,默认为地址本身
+									// P0: 节点名称地区化 —— 有用户备注(match[3])则优先使用；
+									// 无备注时改为"地区-序号"(识别不到地区的 CF 段外/域名节点回退为地址本身)。
+									if (match[3]) {
+										节点备注 = match[3];
+									} else {
+										const 地区 = 识别地区(节点地址);
+										if (地区) {
+											const 序号 = (地区序号计数.get(地区) || 0) + 1;
+											地区序号计数.set(地区, 序号);
+											节点备注 = `${地区}-${序号}`;
+										} else {
+											节点备注 = 节点地址;  // 无法识别地区，回退为地址本身(原行为)
+										}
+									}
 								} else {
 									// 不规范的格式，跳过处理返回null
 									console.warn(`[订阅内容] 不规范的IP格式已忽略: ${原始地址}`);
