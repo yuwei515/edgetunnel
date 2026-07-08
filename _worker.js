@@ -357,6 +357,31 @@ export default {
 						let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
 						if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
 						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
+					} else if (访问路径 === 'admin/nodes.json') {// P2: 节点管理 —— 返回结构化节点列表(IP/端口/地区/备注/序号)
+						// 复用订阅入口相同的优选 IP 来源：随机IP库启用则生成随机IP，否则用 KV 的 ADD.txt；为空再回退随机生成
+						let 优选IP源 = config_JSON.优选订阅生成.本地IP库.随机IP
+							? (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[0]
+							: (await env.KV.get('ADD.txt') ? await 整理成数组(await env.KV.get('ADD.txt')) : (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[0]);
+						const 地址正则 = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+						const 地区序号 = new Map();
+						const 节点列表 = 优选IP源.map(原始 => {
+							const match = 原始.match(地址正则);
+							if (!match) return null;
+							const 地址 = match[1] || '';
+							const 端口 = match[2] || '443';
+							const 备注 = match[3] || '';
+							const 地区 = 识别地区(地址);
+							// 序号沿用订阅命名规则：仅地区化节点(有地区)各自编序；有用户备注的节点不占序号
+							let 序号 = null;
+							if (地区) {
+								序号 = (地区序号.get(地区) || 0) + 1;
+								地区序号.set(地区, 序号);
+							}
+							return { 地址, 端口, 地区, 备注, 序号, 原始 };
+						}).filter(Boolean);
+						const 地区统计 = {};
+						for (const n of 节点列表) if (n.地区) 地区统计[n.地区] = (地区统计[n.地区] || 0) + 1;
+						return new Response(JSON.stringify({ 节点列表, 地区统计, 总数: 节点列表.length }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					} else if (访问路径 === 'admin/cf.json') {// CF配置文件
 						return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					}
