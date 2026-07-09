@@ -73,6 +73,63 @@ function 解析地区过滤参数(url) {
 	const 列表 = raw.split(/[，,\s]+/).map(s => s.trim()).filter(Boolean);
 	return 列表.length ? 列表 : null;
 }
+// P3: 按地区均衡优选 —— 对随机生成的 CF IP 列表做"识别地区→分组→每组Top N→合并取前Total"。
+// 目的：让订阅每个地区都有节点，而非某一大段（如香港）独占全部名额。
+// 算法（参 lines: 识别地区+预设地区优先级）：
+//   1) 逐个 识别地区 归桶；未识别地区(非CF段/IPv6/域名)直接丢弃，不污染结果
+//   2) 每个地区桶内随机打乱后取 Top 每地区上限（无延迟数据，用「桶内随机」近似"最优"）
+//   3) 按地区优先级顺序组间轮流取(轮转保证每地区都有)，凑满 总数
+//   4) 若总节点不足 总数：先穷尽各桶再放宽（不足就是不足，不补未识别）
+// 注：仅作用于随机IP生成分支；用户手填 ADD.txt 不经过本函数(尊重用户明确指定)。
+const 地区优先级 = ['香港', '日本', '美国', '新加坡', '台湾', '韩国', '欧洲'];
+function 按地区均衡优选(IP列表, 总数, 每地区上限) {
+	if (!IP列表 || IP列表.length === 0) return [];
+	// 1) 分桶：识别地区 → Map<地区, string[]>
+	const 桶 = new Map();
+	for (const 元素 of IP列表) {
+		// 元素形如 "ip:port"（随机生成已不带备注）或 "ip:port#备注"
+		const 地址部分 = 元素.split('#')[0];
+		const m = 地址部分.match(/^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9.-]+)(?::\d+)?$/);
+		if (!m) continue;
+		const 地区 = 识别地区(m[1]);
+		if (!地区) continue; // 未识别地区丢弃
+		if (!桶.has(地区)) 桶.set(地区, []);
+		桶.get(地区).push(元素);
+	}
+	if (桶.size === 0) return [];
+	// 2) 每桶随机打乱 + 各取上限
+	const 桶Top = new Map(); // 地区 -> 取出的元素数组(已截到上限)
+	for (const [地区, 列表] of 桶) {
+		// Fisher-Yates 洗牌（Worker 无 crypto 随机，用 Math.random 近似）
+		for (let i = 列表.length - 1; i > 0; i--) {
+			const j = Math.floor(Math.random() * (i + 1));
+			[列表[i], 列表[j]] = [列表[j], 列表[i]];
+		}
+		桶Top.set(地区, 列表.slice(0, 每地区上限));
+	}
+	// 3) 组间轮流取，按地区优先级排前面，其余桶按出现顺序补后
+	const 已排序地区 = [...桶Top.keys()].sort((a, b) => {
+		const ia = 地区优先级.indexOf(a), ib = 地区优先级.indexOf(b);
+		return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+	});
+	// 4) 轮转抽取。每轮从每个桶取1个，直到取满 总数 或所有桶空
+	const 结果 = [];
+	let 桶指针 = 已排序地区.map(() => 0);
+	while (结果.length < 总数) {
+		let 本轮有取 = false;
+		for (let i = 0; i < 已排序地区.length && 结果.length < 总数; i++) {
+			const 桶数组 = 桶Top.get(已排序地区[i]);
+			const idx = 桶指针[i];
+			if (idx < 桶数组.length) {
+				结果.push(桶数组[idx]);
+				桶指针[i] = idx + 1;
+				本轮有取 = true;
+			}
+		}
+		if (!本轮有取) break; // 所有桶都取完，不足就不足
+	}
+	return 结果;
+}
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
@@ -445,11 +502,23 @@ export default {
 							let 完整优选IP = [], 其他节点LINK = '', 反代IP池 = [];
 
 							if (!url.searchParams.has('sub') && config_JSON.优选订阅生成.local) { // 本地生成订阅
-								const 完整优选列表 = config_JSON.优选订阅生成.本地IP库.随机IP ? (
-									await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口)
-								)[0] : await env.KV.get('ADD.txt') ? await 整理成数组(await env.KV.get('ADD.txt')) : (
-									await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口)
-								)[0];
+								// P3: 判定本次 IP 来源是否随机生成(走 均衡优选)；手填 ADD.txt 不参与均衡
+								const _ADDtxt内容 = config_JSON.优选订阅生成.本地IP库.随机IP ? null : await env.KV.get('ADD.txt');
+								const _本次走随机 = config_JSON.优选订阅生成.本地IP库.随机IP || !_ADDtxt内容;
+								let 完整优选列表;
+								if (config_JSON.优选订阅生成.本地IP库.随机IP) {
+									完整优选列表 = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[0];
+								} else if (_ADDtxt内容) {
+									完整优选列表 = await 整理成数组(_ADDtxt内容);
+								} else {
+									完整优选列表 = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[0];
+								}
+								// P3: 随机生成分支做"识别地区→分组→每地区Top上限→合并取前总数"均衡优选
+								if (_本次走随机) {
+									const _总数 = config_JSON.优选订阅生成.本地IP库.均优选总数 || 25;
+									const _单地区上限 = config_JSON.优选订阅生成.本地IP库.每地区上限 || 5;
+									完整优选列表 = 按地区均衡优选(完整优选列表, _总数, _单地区上限);
+								}
 								const 优选API = [], 优选IP = [], 其他节点 = [];
 								for (const 元素 of 完整优选列表) {
 									if (元素.toLowerCase().startsWith('sub://')) {
@@ -5063,8 +5132,10 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			local: true, // true: 基于本地的优选地址  false: 优选订阅生成器
 			本地IP库: {
 				随机IP: true, // 当 随机IP 为true时生效，启用随机IP的数量，否则使用KV内的ADD.txt
-				随机数量: 16,
+				随机数量: 30, // 随机生成的 IP 总数(均衡优选前的候选池，需 ≥ 总数，留余量给未识别地区丢弃)
 				指定端口: -1,
+				均优选总数: 25, // P3: 均衡优选后订阅节点总数(每地区都有节点)
+				每地区上限: 5, // P3: 单个地区最多取多少个节点
 			},
 			SUB: null,
 			SUBNAME: "edge" + "tunnel",
