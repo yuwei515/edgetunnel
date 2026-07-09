@@ -5303,14 +5303,7 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const url = new URL(request.url);
 	const 查询参数运营商 = String(url.searchParams.get('cnIspCode') || '').toLowerCase();
 	const 运营商文件标识 = ['ct', 'cu', 'cmcc', 'cf'].includes(查询参数运营商) ? 查询参数运营商 : 识别运营商(request);
-	const 运营商名称映射 = {
-		cmcc: 'CF移动优选',
-		cu: 'CF联通优选',
-		ct: 'CF电信优选',
-		cf: 'CF官方优选',
-	};
 	const cidr_url = 运营商文件标识 === 'cf' ? `https://raw.githubusercontent.com/${特征码字典[1]}/${特征码字典[1]}/main/CF-CIDR.txt` : `https://raw.githubusercontent.com/${特征码字典[1]}/${特征码字典[1]}/main/CF-CIDR/${运营商文件标识}.txt`;
-	const cfname = 运营商名称映射[运营商文件标识] || 'CF官方优选';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
 	let cidrList = [];
 	try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
@@ -5327,7 +5320,9 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 		const 目标端口 = 指定端口 === -1
 			? cfport[Math.floor(Math.random() * cfport.length)]
 			: 指定端口;
-		return `${ip}:${目标端口}#${cfname}${index + 1}`;
+		// P0: 不再自带运营商前缀备注（#CF官方优选N），让订阅生成时统一走地区化命名（香港-1/日本-2）
+		// 后台 ADD.txt 接口(358行)展示随机IP时也不再带备注，仅显示 IP:端口
+		return `${ip}:${目标端口}`;
 	});
 	return [randomIPs, randomIPs.join('\n')];
 }
