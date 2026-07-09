@@ -130,6 +130,140 @@ function 按地区均衡优选(IP列表, 总数, 每地区上限) {
 	}
 	return 结果;
 }
+// ============ P4: 质量优选（连通性测速 + KV 历史评分） ============
+// 约束说明：Cloudflare Workers 无原始 TCP connect，fetch 测的是 Worker→CF边缘 的出站连通，
+//   无法测真实客户端延迟。故"质量分"以【连通成功率】为度量：本次能否在超时内拿到响应(任意状态码)。
+//   连通=1 不通=0；瞬时区分度有限，主要筛除完全死的 IP。历史评分靠 KV 累计连通率驱动。
+// 评分公式：质量分 = 历史连通率 × 历史权重 + 本次连通 × (1 - 历史权重)
+//   历史权重=0 纯本次实时；=1 纯历史(新节点无历史时退化为本次)。
+// KV 键：node_quality:{ip} = { ok, fail, ok_rate, last }（轻量，仅4字段）
+
+// 单个 IP 连通性探测：超时内拿到任意响应记为可连通。端口默认443。
+// 返回 { addr, port, alive }。alive=true=可连通。
+async function 探测单个IP连通(addr, port, 超时ms) {
+	const controller = new AbortController();
+	const tid = setTimeout(() => controller.abort(), 超时ms);
+	try {
+		// 用 https 协议探测；若证书/SNI 不匹配会抛错，但只要在超时内"有响应或出错"前没 abort，视为可达。
+		// 注意 Workers fetch 直连裸 IP 证书校验失败 → 抛错；仍算"能连上 TCP"的近似(出错而非超时)。
+		await fetch(`https://${addr}:${port || 443}/`, { signal: controller.signal, redirect: 'manual' });
+		clearTimeout(tid);
+		return { addr, port, alive: true };
+	} catch (e) {
+		clearTimeout(tid);
+		// abort=超时=不可连通；其余异常(证书错等)视为 TCP 层可达 → alive=true
+		const 超时 = e && (e.name === 'AbortError' || /abort/i.test(String(e)));
+		return { addr, port, alive: !超时 };
+	}
+}
+
+// 并发测速：限制并发数避免 Workers 子请求超限。返回 Map<"addr:port", alive>
+async function 并发测速(候选列表, 并发数, 超时ms) {
+	const 结果 = new Map();
+	const 列表 = 候选列表.map(e => {
+		const 纯地址 = e.split('#')[0];
+		const m = 纯地址.match(/^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9.-]+)(?::(\d+))?$/);
+		return m ? { 原始: e, addr: m[1], port: m[2] || '443' } : null;
+	}).filter(Boolean);
+	let idx = 0;
+	const worker = async () => {
+		while (idx < 列表.length) {
+			const item = 列表[idx++];
+			const r = await 探测单个IP连通(item.addr, item.port, 超时ms);
+			结果.set(`${item.addr}:${item.port}`, r.alive);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.max(1, Math.min(并发数 | 0, 20)) }, () => worker()));
+	return 结果;
+}
+
+// KV 历史评分读写。读：返回 {ok,fail,ok_rate,last} 或 null(无历史)。写：按本次 alive 增量更新。
+async function 读历史评分(env, addr) {
+	if (!env?.KV || typeof env.KV.get !== 'function') return null;
+	try {
+		const v = await env.KV.get(`node_quality:${addr}`);
+		return v ? JSON.parse(v) : null;
+	} catch { return null; }
+}
+async function 写历史评分(env, addr, 历史, 本次alive) {
+	if (!env?.KV || typeof env.KV.put !== 'function') return;
+	try {
+		const h = 历史 || { ok: 0, fail: 0 };
+		if (本次alive) h.ok += 1; else h.fail += 1;
+		const 总 = h.ok + h.fail;
+		h.ok_rate = 总 > 0 ? h.ok / 总 : (本次alive ? 1 : 0);
+		h.last = Date.now();
+		// 轻量写，4 字段；不设过期(避免历史一直归零)。如需 TLL 可 put 第3参。
+		await env.KV.put(`node_quality:${addr}`, JSON.stringify(h));
+	} catch { /* 写失败忽略，不影响订阅 */ }
+}
+
+// 质量优选：候选识别地区分组 → 组内并发测速+评分 → 每组 Top 单地区上限 → 合并取前总数。
+// 返回与 按地区均衡优选 兼容的元素数组（地区轮转保证每地区都有）。
+async function 按地区质量优选(IP列表, 总数, 每地区上限, 配置, env) {
+	if (!IP列表 || IP列表.length === 0) return [];
+	const 并发数 = 配置.测速并发 ?? 10;
+	const 超时ms = 配置.测速超时 ?? 3000;
+	const 历史权重 = (配置.历史权重 !== undefined) ? 配置.历史权重 : 0.5;
+	// 1) 分桶
+	const 桶 = new Map();
+	for (const 元素 of IP列表) {
+		const 地址部分 = 元素.split('#')[0];
+		const m = 地址部分.match(/^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9.-]+)(?::\d+)?$/);
+		if (!m) continue;
+		const 地区 = 识别地区(m[1]);
+		if (!地区) continue;
+		if (!桶.has(地区)) 桶.set(地区, []);
+		桶.get(地区).push(元素);
+	}
+	if (桶.size === 0) return [];
+	// 2) 全量并发测速（跨地区一起测，复用连接池并发更高效）
+	const 全部候选 = [...桶.values()].flat();
+	const 测速结果 = await 并发测速(全部候选, 并发数, 超时ms);
+	// 3) 组内：读历史 → 算质量分 → 排序取Top
+	const 桶Top = new Map();
+	for (const [地区, 列表] of 桶) {
+		// 对每个元素串行读历史(KV读并发已由测速限制，这里读量=桶大小，量小可接受)；如需更快可改并发读
+		const 评分列表 = [];
+		for (const 元素 of 列表) {
+			const 纯地址 = 元素.split('#')[0];
+			const m = 纯地址.match(/^([\d.]+|[a-zA-Z0-9.-]+|\[[\da-fA-F:]+\]):(\d+)$/);
+			const addrKey = m ? m[1] : 纯地址;
+			const 本次alive = 测速结果.get(纯地址) ?? false;
+			const 历史 = await 读历史评分(env, addrKey);
+			const 历史率 = 历史?.ok_rate ?? (本次alive ? 1 : 0);
+			const 分 = 历史率 * 历史权重 + 本次alive * (1 - 历史权重);
+			评分列表.push({ 元素, 分, 本次alive, addrKey, 有历史: !!历史 });
+		}
+		// 分高优先；无历史新节点本次连通也高分；同分随机扰动
+		评分列表.sort((a, b) => b.分 - a.分 || Math.random() - 0.5);
+		桶Top.set(地区, 评分列表.slice(0, 每地区上限));
+		// 写回历史：仅写本次测过的本组Top，减少KV写次数
+		await Promise.all(评分列表.slice(0, 每地区上限).map(x => 写历史评分(env, x.addrKey, null, x.本次alive)));
+	}
+	// 4) 按地区优先级轮流取（同 按地区均衡优选）
+	const 已排序地区 = [...桶Top.keys()].sort((a, b) => {
+		const ia = 地区优先级.indexOf(a), ib = 地区优先级.indexOf(b);
+		return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+	});
+	const 结果 = [];
+	const 桶指针 = 已排序地区.map(() => 0);
+	while (结果.length < 总数) {
+		let 本轮有取 = false;
+		for (let i = 0; i < 已排序地区.length && 结果.length < 总数; i++) {
+			const 桶数组 = 桶Top.get(已排序地区[i]);
+			const idx = 桶指针[i];
+			if (idx < 桶数组.length) {
+				结果.push(桶数组[idx].元素);
+				桶指针[i] = idx + 1;
+				本轮有取 = true;
+			}
+		}
+		if (!本轮有取) break;
+	}
+	return 结果;
+}
+// ============ /P4 质量优选 ============
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
@@ -513,11 +647,16 @@ export default {
 								} else {
 									完整优选列表 = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[0];
 								}
-								// P3: 随机生成分支做"识别地区→分组→每地区Top上限→合并取前总数"均衡优选
+								// P3/P4: 随机生成分支按"优选模式"分流：均衡(随机均衡)或 质量(测速评分)
 								if (_本次走随机) {
 									const _总数 = config_JSON.优选订阅生成.本地IP库.均优选总数 || 25;
 									const _单地区上限 = config_JSON.优选订阅生成.本地IP库.每地区上限 || 5;
-									完整优选列表 = 按地区均衡优选(完整优选列表, _总数, _单地区上限);
+									const _模式 = (config_JSON.优选订阅生成.优选模式 || '均衡');
+									if (_模式 === '质量') {
+										完整优选列表 = await 按地区质量优选(完整优选列表, _总数, _单地区上限, config_JSON.优选订阅生成.质量优选 || {}, env);
+									} else {
+										完整优选列表 = 按地区均衡优选(完整优选列表, _总数, _单地区上限);
+									}
 								}
 								const 优选API = [], 优选IP = [], 其他节点 = [];
 								for (const 元素 of 完整优选列表) {
@@ -5130,12 +5269,18 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		Fingerprint: "chrome",
 		优选订阅生成: {
 			local: true, // true: 基于本地的优选地址  false: 优选订阅生成器
+			优选模式: '均衡', // P4: 均衡(随机均衡)/质量(测速评分)。手填ADD.txt或优选订阅生成器时本项不生效
 			本地IP库: {
 				随机IP: true, // 当 随机IP 为true时生效，启用随机IP的数量，否则使用KV内的ADD.txt
 				随机数量: 30, // 随机生成的 IP 总数(均衡优选前的候选池，需 ≥ 总数，留余量给未识别地区丢弃)
 				指定端口: -1,
 				均优选总数: 25, // P3: 均衡优选后订阅节点总数(每地区都有节点)
 				每地区上限: 5, // P3: 单个地区最多取多少个节点
+			},
+			质量优选: { // P4: 仅当 优选模式='质量' 时生效
+				测速并发: 10, // 并发测速数(上限20，避免Workers子请求超限)
+				测速超时: 3000, // 单次测速超时毫秒
+				历史权重: 0.5, // 0=纯本次实时 1=纯历史；新节点无历史时退化为本次
 			},
 			SUB: null,
 			SUBNAME: "edge" + "tunnel",
